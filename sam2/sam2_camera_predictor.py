@@ -39,7 +39,7 @@ class SAM2CameraPredictor(SAM2Base):
         self.condition_state = {}
         self.frame_idx = 0
 
-    def perpare_data(
+    def prepare_data(
         self,
         img,
         image_size=1024,
@@ -65,11 +65,17 @@ class SAM2CameraPredictor(SAM2Base):
 
     @torch.inference_mode()
     def load_first_frame(self, img):
-
+        """
+        Load and initialize tracking with the first frame from camera or video source.
+        
+        Args:
+            img: Input image as numpy array (BGR format, e.g., from OpenCV or RealSense camera).
+                 Shape should be (H, W, 3) with uint8 dtype.
+        """
         self.condition_state = self._init_state(
             offload_video_to_cpu=False, offload_state_to_cpu=False
         )
-        img, width, height = self.perpare_data(img, image_size=self.image_size)
+        img, width, height = self.prepare_data(img, image_size=self.image_size)
         self.condition_state["images"] = [img]
         self.condition_state["num_frames"] = len(self.condition_state["images"])
         self.condition_state["video_height"] = height
@@ -77,7 +83,7 @@ class SAM2CameraPredictor(SAM2Base):
         self._get_image_feature(frame_idx=0, batch_size=1)
 
     def add_conditioning_frame(self, img):
-        img, width, height = self.perpare_data(img, image_size=self.image_size)
+        img, width, height = self.prepare_data(img, image_size=self.image_size)
         self.condition_state["images"].append(img)
         self.condition_state["num_frames"] = len(self.condition_state["images"])
         self._get_image_feature(
@@ -669,12 +675,23 @@ class SAM2CameraPredictor(SAM2Base):
         self,
         img,
     ):
+        """
+        Track objects in a new frame from camera or video source.
+        
+        Args:
+            img: Input image as numpy array (BGR format, e.g., from OpenCV or RealSense camera).
+                 Shape should be (H, W, 3) with uint8 dtype.
+        
+        Returns:
+            obj_ids: List of object IDs being tracked
+            video_res_masks: Tensor of mask logits at original video resolution
+        """
         self.frame_idx += 1
         self.condition_state["num_frames"] += 1
         if not self.condition_state["tracking_has_started"]:
             self.propagate_in_video_preflight()
 
-        img, _, _ = self.perpare_data(img, image_size=self.image_size)
+        img, _, _ = self.prepare_data(img, image_size=self.image_size)
 
         output_dict = self.condition_state["output_dict"]
         obj_ids = self.condition_state["obj_ids"]

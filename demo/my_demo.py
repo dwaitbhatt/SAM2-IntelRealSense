@@ -1,44 +1,14 @@
 import os
 import torch
 import numpy as np
-from PIL import Image
 import cv2
 import time
-import glob  
 
-from sam2.build_sam import build_sam2_camera_predictor, build_sam2_video_predictor
+from sam2.build_sam import build_sam2_camera_predictor
 
-# Function to get the latest complete JPG file
-def get_latest_jpg():
-    jpg_files = glob.glob(os.path.join("temp_data", "camera_frames", "*[0-9][0-9][0-9][0-9].jpg"))
-    if not jpg_files:
-        return None
-    
-    # Sort files by number in descending order
-    sorted_files = sorted(jpg_files, key=lambda f: int(os.path.splitext(os.path.basename(f))[0][-4:]), reverse=True)
-    
-    for file in sorted_files:
-        try:
-            img = cv2.imread(file)
-            if img is not None:
-                return file
-        except Exception:
-            pass
-    
-    return None
+from camera import Camera
 
-def wait_for_image(target):
-    while True:
-        # Look for jpg files ending with 0000
-        matching_files = glob.glob(f'temp_data/camera_frames/*{target}.jpg')
-        if matching_files:
-            print(f"Found image: {matching_files[0]}")
-            return matching_files[0]
-        else:
-            print(f"Waiting for image file {target}")
-            time.sleep(1)  # Wait for 1 second before checking again
-
-def add_mask_overlay(frame, out_obj_ids, out_mask_logits):
+def add_mask_overlay(frame, out_obj_ids, out_mask_logits, fps=None):
     height, width = frame.shape[:2]
     # Check mask dimensions
     mask = (out_mask_logits[0] > 0.0).cpu().numpy()    
@@ -49,7 +19,15 @@ def add_mask_overlay(frame, out_obj_ids, out_mask_logits):
     red_mask = np.zeros((height, width, 3), dtype=np.uint8)
     red_mask[mask == 1] = [0, 0, 255]  # Red color
     alpha = 0.5  # Transparency factor
-    return cv2.addWeighted(frame, 1, red_mask, alpha, 0)
+    overlay = cv2.addWeighted(frame, 1, red_mask, alpha, 0)
+    
+    # Add FPS text if provided
+    if fps is not None:
+        fps_text = f"FPS: {fps:.1f}"
+        cv2.putText(overlay, fps_text, (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    
+    return overlay
 
 
 device = torch.device("cuda")
@@ -61,17 +39,68 @@ if torch.cuda.get_device_properties(0).major >= 8:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
+sam2_checkpoint = "//home/erl-xarm6/dwait_ws/SAM2-RealTime-Webcam/checkpoints/sam2.1_hiera_small.pt"
+model_cfg = "//home/erl-xarm6/dwait_ws/SAM2-RealTime-Webcam/checkpoints/sam2.1_hiera_s.yaml"
 
-predictor = build_sam2_camera_predictor(model_cfg, sam2_checkpoint)
+# Configuration options
+SHOW_LIVE_VIEW = True  # Set to True to display segmentation results in a window
+SAVE_TO_DISK = False   # Set to True to save frames to disk
+WINDOW_NAME = "SAM2 Real-Time Segmentation"
+OBJECT_COLOR = 'r'  # Color of object to detect: 'g' for green, 'r' for red
 
-file_name = wait_for_image('0000')
-frame = cv2.imread(file_name)
+# Speed optimization options
+USE_VOS_OPTIMIZED = False  # VOS optimization not available in this codebase - set to False
+REDUCE_IMAGE_SIZE = 512   # Reduce from default 1024 to 512 for faster processing (options: 512, 768, 1024)
+DISABLE_POSTPROCESSING = False  # Disable postprocessing features for speed (may reduce quality slightly)
+CAMERA_RESOLUTION = (480, 360)  # Lower camera resolution for faster processing: (width, height)
+
+# Build predictor with speed optimizations
+hydra_overrides = []
+if REDUCE_IMAGE_SIZE != 1024:
+    hydra_overrides.append(f"++model.image_size={REDUCE_IMAGE_SIZE}")
+    print(f"Using reduced image size: {REDUCE_IMAGE_SIZE}x{REDUCE_IMAGE_SIZE} for faster inference")
+
+predictor = build_sam2_camera_predictor(
+    model_cfg, 
+    sam2_checkpoint,
+    vos_optimized=USE_VOS_OPTIMIZED,
+    apply_postprocessing=not DISABLE_POSTPROCESSING,
+    hydra_overrides_extra=hydra_overrides
+)
+
+# Initialize RealSense camera
+print("Initializing RealSense camera...")
+camera = Camera(debug=False, imsize=CAMERA_RESOLUTION)
+print(f"Camera initialized successfully with resolution: {CAMERA_RESOLUTION[0]}x{CAMERA_RESOLUTION[1]}")
+
+# Wait for first frame from camera with object detection
+print("Waiting for first frame and detecting object...")
+frame = None
+object_pos = None
+max_attempts = 100  # Maximum attempts to detect object
+attempt = 0
+
+while frame is None or object_pos is None:
+    result = camera.fetch_image(detect_object=True, color=OBJECT_COLOR)  # Detect object
+    if result is not None:
+        frame, _, pos = result  # Get color image, depth, and position
+        if pos is not None:
+            object_pos = pos
+            print(f"First frame captured and object detected at: {object_pos}")
+            break
+        else:
+            attempt += 1
+            if attempt >= max_attempts:
+                print(f"Warning: object not detected after {max_attempts} attempts. Using center of image.")
+                # Fallback to center if object not detected
+                height, width = frame.shape[:2]
+                object_pos = np.array([width // 2, height // 2])
+                break
+            print(f"object not detected, attempt {attempt}/{max_attempts}...")
+    time.sleep(0.1)
 
 # read the first frame
 predictor.load_first_frame(frame)
-if_init = True
 
 ann_frame_idx = 0  # the frame index we interact with
 
@@ -79,7 +108,9 @@ ann_obj_id = (
     1  # give a unique id to each object we interact with (it can be any integers)
 )
 
-points = np.array([[320, 240]], dtype=np.float32) # center of the image
+# Use detected object position as the initial point
+points = np.array([[object_pos[0], object_pos[1]]], dtype=np.float32)
+print(f"Using detected object position {object_pos} as initial segmentation point")
 
 # for labels, `1` means positive click and `0` means negative click
 labels = np.array([1], dtype=np.int32)
@@ -92,39 +123,94 @@ _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(
 )
 
 # out_obj_ids, out_mask_logits = predictor.track(frame)
-overlay = add_mask_overlay(frame, out_obj_ids, out_mask_logits)
-# Ensure the directory exists
-# os.makedirs("temp_data", "input_images", exist_ok=True)
+overlay = add_mask_overlay(frame, out_obj_ids, out_mask_logits, fps=None)
 
-# Get the base filename without path
-base_filename = os.path.basename(file_name)
-# Construct the full output path
-output_path = os.path.join("temp_data", "input_images", f"result_{base_filename}")
-# Write the image
-cv2.imwrite(output_path, overlay)
-
+# Show live view if enabled
+if SHOW_LIVE_VIEW:
+    cv2.imshow(WINDOW_NAME, overlay)
+    print(f"Displaying initial frame with mask. Press 'q' to quit.")
+    
+# Save to disk if enabled
+if SAVE_TO_DISK:
+    os.makedirs("temp_data/input_images", exist_ok=True)
+    output_path = os.path.join("temp_data", "input_images", f"result_frame_{ann_frame_idx:04d}.jpg")
+    cv2.imwrite(output_path, overlay)
+    print(f"Saved initial frame with mask: {output_path}")
 
 # start tracking videos
-while 1:
-    ann_frame_idx += 1
-    # Format the file names with leading zeros
-    # target_file = f"{ann_frame_idx:04d}"
-    
-    # Wait for the image file using the wait_for_image function
-    # file_name = wait_for_image(target_file)
-    file_name = get_latest_jpg()
-    if file_name:
-        frame = cv2.imread(file_name)
-        # Track objects in the new frame
-        out_obj_ids, out_mask_logits = predictor.track(frame)
-        overlay = add_mask_overlay(frame, out_obj_ids, out_mask_logits)
-        # Construct the full output path
-        output_path = os.path.join("temp_data", "input_images", f"result_{os.path.basename(file_name)}")  
-        # Write the image
-        cv2.imwrite(output_path, overlay)
-    else:
-        print("Error: no frame read")
+print("Starting continuous tracking...")
+if SHOW_LIVE_VIEW:
+    print(f"Live view enabled. Press 'q' in the window to quit.")
+if SAVE_TO_DISK:
+    print(f"Saving frames to disk: temp_data/input_images/")
+
+# FPS tracking variables
+fps = 0.0
+fps_update_time = time.time()
+fps_frame_count = 0
+fps_window = 30  # Number of frames to average for FPS calculation
+frame_times = []
+
+ann_frame_idx = 1
+while True:
+    try:
+        # Start timing for FPS calculation
+        frame_start_time = time.time()
+        
+        # Get frame from camera
+        result = camera.fetch_image()
+        if result is not None:
+            frame, _ = result  # Get color image
+            # Track objects in the new frame
+            out_obj_ids, out_mask_logits = predictor.track(frame)
+            
+            # Calculate FPS
+            frame_time = time.time() - frame_start_time
+            frame_times.append(frame_time)
+            if len(frame_times) > fps_window:
+                frame_times.pop(0)
+            
+            # Update FPS display periodically
+            fps_frame_count += 1
+            if fps_frame_count >= fps_window or time.time() - fps_update_time > 1.0:
+                if len(frame_times) > 0:
+                    avg_frame_time = np.mean(frame_times)
+                    fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0.0
+                fps_update_time = time.time()
+            
+            overlay = add_mask_overlay(frame, out_obj_ids, out_mask_logits, fps)
+            
+            # Show live view if enabled
+            if SHOW_LIVE_VIEW:
+                cv2.imshow(WINDOW_NAME, overlay)
+                # Check for 'q' key press to quit
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("\n'q' pressed - stopping tracking...")
+                    break
+            
+            # Save to disk if enabled
+            if SAVE_TO_DISK:
+                output_path = os.path.join("temp_data", "input_images", f"result_frame_{ann_frame_idx:04d}.jpg")
+                cv2.imwrite(output_path, overlay)
+            
+            ann_frame_idx += 1
+        else:
+            print("Warning: No frame available from camera, retrying...")
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt - stopping tracking...")
         break
+    except Exception as e:
+        print(f"Error during tracking: {e}")
+        break
+
+# Clean up
+if SHOW_LIVE_VIEW:
+    cv2.destroyAllWindows()
+print("Closing camera...")
+camera.close()
+print("Camera closed successfully")
 
 
 
