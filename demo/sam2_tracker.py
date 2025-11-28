@@ -16,7 +16,7 @@ class SAM2Tracker:
     Supports tracking 1 or 2 objects in a video/camera stream with automatic initialization.
     """
     
-    def __init__(self, camera, model_type="small", init_pos_object_color=None, object_count=1, 
+    def __init__(self, camera, model_type="small", init_pos_object_color=None, 
                  image_size=512, debug=False, window_name="SAM2 Tracker"):
         """
         Initialize SAM2 tracker.
@@ -26,18 +26,19 @@ class SAM2Tracker:
                    Required if init_pos_object_color contains only colors (for auto-detection).
                    Can be None if frames and positions are always provided.
             model_type (str): Model type, either "tiny" or "small"
-            init_pos_object_color (list): List of entries for each object. Two formats supported:
+            init_pos_object_color (list): List of entries for each object. Three formats supported:
                                          - With positions: [[x1, y1, 'g']] or [[x1, y1, 'g'], [x2, y2, 'r']]
                                          - Colors only (auto-detect): [['g']] or [['g'], ['r']]
-                                         If colors only, camera must be provided for auto-detection.
-            object_count (int): Number of objects to track (1 or 2)
+                                         - Human interactive: ["human"] or [["human"], ["human"]] to show live feed for user clicks
+                                         Mixed modes are supported: e.g., ["human", 'g'] uses human input for object 1 and color detection for object 2.
+                                         If colors only or human interactive, camera must be provided.
             image_size (int): Internal image size for processing (512, 768, or 1024)
             debug (bool): If True, display segmentation masks overlaid on the original image using cv2.imshow()
             window_name (str): Name of the debug display window
         """
         self.camera = camera
         self.model_type = model_type
-        self.object_count = object_count
+        self.object_count = len(init_pos_object_color)
         self.image_size = image_size
         self.debug = debug
         self.window_name = window_name
@@ -46,31 +47,40 @@ class SAM2Tracker:
         self.mask_colors = [
             (0, 0, 255),   # Red for object 1
             (0, 255, 0),   # Green for object 2
+            (255, 0, 0),   # Blue for object 3
         ]
         
         # Validate inputs
-        if object_count not in [1, 2]:
-            raise ValueError(f"object_count must be 1 or 2, got {object_count}")
-        
         if model_type not in ["tiny", "small"]:
             raise ValueError(f"model_type must be 'tiny' or 'small', got {model_type}")
         
         if init_pos_object_color is None:
             raise ValueError("init_pos_object_color must be provided")
         
-        if len(init_pos_object_color) != object_count:
-            raise ValueError(f"init_pos_object_color must have {object_count} entries, got {len(init_pos_object_color)}")
+        # Check which objects need human input (per-object basis)
+        self._human_object_indices = []  # List of object indices that need human input
+        self._colors_only_object_indices = []  # List of object indices that need color detection
         
-        # Check if colors-only mode is used (only color provided, no positions)
-        self._colors_only_mode = False
-        for item in init_pos_object_color:
-            if len(item) == 1:
-                # Only color provided
-                self._colors_only_mode = True
-                break
+        for i, item in enumerate(init_pos_object_color):
+            # Check if this object needs human input
+            if isinstance(item, str) and item == "human":
+                self._human_object_indices.append(i)
+            elif isinstance(item, list) and len(item) == 1 and item[0] == "human":
+                self._human_object_indices.append(i)
+            # Check if this object needs color-only detection
+            elif isinstance(item, list) and len(item) == 1:
+                # Only color provided (not "human")
+                self._colors_only_object_indices.append(i)
+            elif isinstance(item, str) and len(item) == 1:
+                # Single character string like 'g' - treat as color
+                self._colors_only_object_indices.append(i)
         
-        # If colors-only mode, camera must be provided
-        if self._colors_only_mode and camera is None:
+        # If any object needs human-interactive mode, camera must be provided
+        if len(self._human_object_indices) > 0 and camera is None:
+            raise ValueError("camera must be provided when using human-interactive mode")
+        
+        # If any object needs colors-only mode, camera must be provided
+        if len(self._colors_only_object_indices) > 0 and camera is None:
             raise ValueError("camera must be provided when using colors-only mode (auto-detection)")
         
         # Setup CUDA optimizations
@@ -91,7 +101,7 @@ class SAM2Tracker:
         self._init_pos_object_color = init_pos_object_color
         
         # Object IDs (using 1-indexed IDs)
-        self._obj_ids = list(range(1, object_count + 1))
+        self._obj_ids = list(range(1, self.object_count + 1))
         
     def _init_model(self):
         """Initialize the SAM2 model based on model_type."""
@@ -122,60 +132,197 @@ class SAM2Tracker:
     def _detect_object_positions(self, max_attempts=100):
         """
         Automatically detect object positions using camera based on colors.
+        Only detects objects that are in the colors-only mode.
         
         Args:
             max_attempts (int): Maximum attempts to detect each object
             
         Returns:
-            list: List of [x, y, color] for each object
+            dict: Dictionary mapping object index to [x, y, color]
         """
-        detected_positions = []
+        detected_positions = {}
         
-        for i, item in enumerate(self._init_pos_object_color):
-            if len(item) == 1:
-                # Only color provided - need to detect
+        for i in self._colors_only_object_indices:
+            item = self._init_pos_object_color[i]
+            # Extract color - could be from [color] format or just a string
+            if isinstance(item, list):
                 color = item[0]
-                print(f"Auto-detecting object {i+1} with color '{color}'...")
+            else:  # It's a string
+                color = item
+            print(f"Auto-detecting object {i+1} with color '{color}'...")
+            
+            for attempt in range(max_attempts):
+                result = self.camera.fetch_image(detect_object=True, color=color)
+                if result is not None:
+                    _, _, pos = result
+                    if pos is not None:
+                        detected_positions[i] = [pos[0], pos[1], color]
+                        print(f"Object {i+1} detected at: [{pos[0]:.1f}, {pos[1]:.1f}]")
+                        break
                 
-                for attempt in range(max_attempts):
-                    result = self.camera.fetch_image(detect_object=True, color=color)
+                if attempt == max_attempts - 1:
+                    # Fallback to center if not detected
+                    result = self.camera.fetch_image()
                     if result is not None:
-                        _, _, pos = result
-                        if pos is not None:
-                            detected_positions.append([pos[0], pos[1], color])
-                            print(f"Object {i+1} detected at: [{pos[0]:.1f}, {pos[1]:.1f}]")
-                            break
-                    
-                    if attempt == max_attempts - 1:
-                        # Fallback to center if not detected
-                        result = self.camera.fetch_image()
-                        if result is not None:
-                            frame, _ = result
-                            height, width = frame.shape[:2]
-                            detected_positions.append([width // 2, height // 2, color])
-                            print(f"Object {i+1} not detected after {max_attempts} attempts. Using center.")
-                        else:
-                            raise RuntimeError(f"Could not get frame from camera for object {i+1}")
-            else:
-                # Position already provided
-                detected_positions.append(item)
+                        frame, _ = result
+                        height, width = frame.shape[:2]
+                        detected_positions[i] = [width // 2, height // 2, color]
+                        print(f"Object {i+1} not detected after {max_attempts} attempts. Using center.")
+                    else:
+                        raise RuntimeError(f"Could not get frame from camera for object {i+1}")
         
         return detected_positions
+    
+    def _get_human_clicked_positions(self):
+        """
+        Show a live camera feed and allow user to click on points to select object positions.
+        Only collects clicks for objects that need human input.
+        
+        Returns:
+            tuple: (dict mapping object index to [x, y, None], last frame used for clicking)
+        """
+        clicked_positions = {}  # Dictionary mapping object index to position
+        human_object_count = len(self._human_object_indices)
+        click_count = 0
+        click_window_name = "Click to Select Object Positions (Press 'q' when done)"
+        last_frame = None
+        
+        # Mouse callback to capture clicks
+        clicked_points = []
+        def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                clicked_points.append((x, y))
+                print(f"Clicked at: ({x}, {y})")
+        
+        # Create window and set mouse callback
+        cv2.namedWindow(click_window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(click_window_name, 1280, 720)  # Set window to larger size
+        cv2.setMouseCallback(click_window_name, mouse_callback)
+        
+        print(f"\n{'='*60}")
+        print(f"Human Interactive Mode: Please click on {human_object_count} object(s) to track")
+        if len(self._colors_only_object_indices) > 0:
+            print(f"Note: {len(self._colors_only_object_indices)} object(s) will be auto-detected by color")
+        print(f"Click on each object in the camera feed, then press 'q' to continue")
+        print(f"{'='*60}\n")
+        
+        try:
+            while click_count < human_object_count:
+                # Get frame from camera
+                result = self.camera.fetch_image()
+                if result is None:
+                    continue
+                
+                frame, _ = result
+                last_frame = frame.copy()  # Keep the last frame
+                
+                # Determine which human object we're currently clicking
+                current_obj_idx = self._human_object_indices[click_count]
+                current_obj_num = current_obj_idx + 1  # 1-indexed for display
+                
+                # Draw instructions on frame
+                display_frame = frame.copy()
+                cv2.putText(display_frame, f"Click on object {current_obj_num} ({click_count + 1} of {human_object_count})", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(display_frame, "Press 'q' when done", 
+                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Draw already clicked points (with correct object indices)
+                for obj_idx, pos in clicked_positions.items():
+                    cx, cy = pos[0], pos[1]  # Extract x, y from [x, y, None] format
+                    color_idx = obj_idx % len(self.mask_colors)
+                    cv2.circle(display_frame, (int(cx), int(cy)), 10, self.mask_colors[color_idx], -1)
+                    cv2.circle(display_frame, (int(cx), int(cy)), 15, (255, 255, 255), 2)
+                
+                # Show frame
+                cv2.imshow(click_window_name, display_frame)
+                
+                # Check for new clicks
+                if len(clicked_points) > click_count:
+                    x, y = clicked_points[click_count]
+                    clicked_positions[current_obj_idx] = [x, y, None]
+                    click_count += 1
+                    print(f"Object {current_obj_num} selected at: [{x}, {y}]")
+                
+                # Check for 'q' key to finish early (if all objects clicked)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    if click_count >= human_object_count:
+                        break
+                    else:
+                        print(f"Warning: Only {click_count} of {human_object_count} objects selected. Please click all objects.")
+        
+        finally:
+            cv2.destroyWindow(click_window_name)
+        
+        # Ensure we have enough positions (fill with center if not enough clicks)
+        while len(clicked_positions) < human_object_count:
+            # Determine which object we're filling
+            missing_obj_idx = self._human_object_indices[len(clicked_positions)]
+            missing_obj_num = missing_obj_idx + 1
+            
+            # Get a frame to determine center
+            result = self.camera.fetch_image()
+            if result is None:
+                # Fallback to default center
+                clicked_positions[missing_obj_idx] = [320, 240, None]
+            else:
+                frame, _ = result
+                last_frame = frame.copy()
+                height, width = frame.shape[:2]
+                clicked_positions[missing_obj_idx] = [width // 2, height // 2, None]
+                print(f"Warning: Not enough clicks. Using center for object {missing_obj_num}")
+        
+        # If we don't have a last frame, get one
+        if last_frame is None:
+            result = self.camera.fetch_image()
+            if result is not None:
+                last_frame, _ = result
+        
+        return clicked_positions, last_frame
     
     def _initialize_tracking(self, frame):
         """
         Initialize tracking with the first frame and object positions.
+        Handles mixed modes: some objects use human input, some use color detection, some use pre-provided positions.
         
         Args:
-            frame: First frame from camera
+            frame: First frame from camera (may be overridden in human-interactive mode)
         """
-        # If colors-only mode, detect positions first
-        if self._colors_only_mode:
-            # Detect all object positions using camera
-            init_positions = self._detect_object_positions()
-        else:
-            # Positions already provided
-            init_positions = self._init_pos_object_color
+        # Collect all positions in order (one per object)
+        init_positions = [None] * self.object_count
+        
+        # Get human-clicked positions if any objects need them
+        clicked_positions = {}
+        clicked_frame = None
+        if len(self._human_object_indices) > 0:
+            clicked_positions, clicked_frame = self._get_human_clicked_positions()
+            if clicked_frame is not None:
+                frame = clicked_frame  # Use the frame from clicking
+        
+        # Get color-detected positions if any objects need them
+        detected_positions = {}
+        if len(self._colors_only_object_indices) > 0:
+            detected_positions = self._detect_object_positions()
+        
+        # Combine all positions in order
+        for i in range(self.object_count):
+            if i in clicked_positions:
+                # Use human-clicked position
+                init_positions[i] = clicked_positions[i]
+            elif i in detected_positions:
+                # Use color-detected position
+                init_positions[i] = detected_positions[i]
+            else:
+                # Use pre-provided position
+                init_positions[i] = self._init_pos_object_color[i]
+        
+        # If we still don't have a frame, get one from camera
+        if frame is None:
+            if self.camera is not None:
+                result = self.camera.fetch_image()
+                if result is not None:
+                    frame, _ = result
         
         # Load first frame into predictor
         self.predictor.load_first_frame(frame)
@@ -202,6 +349,8 @@ class SAM2Tracker:
         
         self._is_initialized = True
         print(f"Tracking initialized for {self.object_count} object(s)")
+        
+        return frame  # Return the frame that was used for initialization
     
     def _create_overlay(self, frame, masks):
         """
@@ -257,29 +406,24 @@ class SAM2Tracker:
             
             frame, _ = result  # Get color image (ignore depth)
         
-        # Validate frame
-        if frame is None or not isinstance(frame, np.ndarray):
-            return None
-        
         # Handle first frame initialization
         if not self._is_initialized:
-            # If colors-only mode, we need to use the provided frame (or get one)
-            # for position detection, then use that same frame for initialization
-            if self._colors_only_mode:
-                # Use the provided frame or fetch one
-                if frame is None:
-                    result = self.camera.fetch_image()
-                    if result is None:
-                        return None
-                    frame, _ = result
+            # _initialize_tracking will handle fetching frames if needed for human input or color detection
+            # It returns the frame that was used for initialization
+            frame = self._initialize_tracking(frame)
             
-            self._initialize_tracking(frame)
+            # Validate frame after initialization
+            if frame is None or not isinstance(frame, np.ndarray):
+                return None
             # After initialization, track() will use the initialized state
             # Note: First frame masks come from add_new_prompt, but we call track()
             # to properly start the tracking pipeline for subsequent frames
             out_obj_ids, out_mask_logits = self.predictor.track(frame)
         else:
             # Track objects in subsequent frames
+            # Validate frame
+            if frame is None or not isinstance(frame, np.ndarray):
+                return None
             out_obj_ids, out_mask_logits = self.predictor.track(frame)
         
         # Extract masks for each object
@@ -343,12 +487,11 @@ class SAM2Tracker:
 if __name__ == "__main__":
     # Auto-detect object positions using colors only
     from camera import Camera
-    camera = Camera(debug=False, imsize=(480, 360))
+    camera = Camera(debug=False)
     tracker = SAM2Tracker(
         camera=camera,
-        model_type="tiny",
-        init_pos_object_color=[['g'], ['r']],
-        object_count=2,
+        model_type="small",
+        init_pos_object_color=['r', 'g', 'human'],
         debug=True,
         window_name="SAM2 Tracker"
     )
